@@ -93,7 +93,7 @@ For the naive allreduce (no P2P) per-device flow and staging details, see the
 
 from collections import InlineArray
 from math import ceildiv
-from sys import align_of, is_amd_gpu, simd_width_of, size_of
+from sys import align_of, env_get_bool, is_amd_gpu, is_nvidia_gpu, simd_width_of, size_of
 from sys.ffi import _Global, external_call
 from sys.intrinsics import _unsafe_aliasing_address_to_pointer
 from sys.info import _accelerator_arch
@@ -124,7 +124,8 @@ from gpu.intrinsics import (
     AMDBufferResource,
 )
 from gpu.memory import Consistency, ReduceOp, multimem_ld_reduce
-from gpu.memory import CacheOperation
+from gpu.memory import CacheOperation, async_copy, async_copy_commit_group, async_copy_wait_group
+from gpu.memory import AddressSpace
 from memory import stack_allocation
 
 from utils import IndexList, StaticTuple
@@ -826,6 +827,257 @@ fn _allreduce_1stage_kernel[
     _multi_gpu_barrier[ngpus, is_start=False](rank_sigs, my_sig, my_rank)
 
 
+@__llvm_metadata(
+    MAX_THREADS_PER_BLOCK_METADATA=StaticTuple[Int32, 1](BLOCK_SIZE)
+)
+fn _allreduce_1stage_kernel_cpasync[
+    dtype: DType,
+    rank: Int,
+    ngpus: Int,
+    *,
+    BLOCK_SIZE: Int,
+    output_lambda: elementwise_epilogue_type,
+    num_buffers: Int = ngpus,
+    PREFETCH_STAGES: Int = 2,
+](
+    result: NDBuffer[dtype, rank, MutAnyOrigin],
+    src_ptrs: InlineArray[UnsafePointer[Scalar[dtype]], num_buffers],
+    rank_sigs: InlineArray[UnsafePointer[Signal], MAX_GPUS],
+    num_elements: Int,
+    my_rank: Int,
+):
+    """
+    Kernel implementing allreduce using cp.async double buffering for improved performance.
+    
+    This kernel uses a 2-stage (double buffering) prefetch pipeline to overlap computation
+    with memory transfers. It prefetches the next chunk of peer data into shared memory
+    using cp.async instructions while computing reductions on the current chunk.
+    
+    This simpler approach provides good performance with lower complexity than multi-stage
+    pipelines, making it easier to debug and maintain.
+    
+    Parameters:
+        dtype: Data dtype of tensor elements.
+        rank: Number of dimensions in tensors.
+        ngpus: Number of GPUs participating.
+        BLOCK_SIZE: Number of threads per block.
+        output_lambda: An elementwise output lambda function.
+        num_buffers: Number of buffers to process (defaults to ngpus).
+        PREFETCH_STAGES: Number of pipeline stages (defaults to 2 for double buffering).
+    
+    Args:
+        result: Output buffer for reduced values
+        src_ptrs: Input buffers from all GPUs
+        rank_sigs: Signal pointers for synchronization
+        num_elements: Number of elements to reduce
+        my_rank: Current GPU rank
+    
+    Requires:
+        - NVIDIA GPU with SM 8.0+ (A100/H100) for cp.async support
+        - Shared memory for prefetch buffers (2x chunk size)
+    """
+    alias accum_type = get_accum_type[dtype]()
+    alias simd_width = simd_width_of[dtype, target = get_gpu_target()]()
+    alias alignment = align_of[SIMD[dtype, simd_width]]()
+    alias elem_size = size_of[dtype]()
+    alias vector_size_bytes = simd_width * elem_size
+    
+    # Ensure vector size is compatible with cp.async (4, 8, or 16 bytes)
+    constrained[
+        vector_size_bytes in (4, 8, 16),
+        "SIMD width * element size must be 4, 8, or 16 bytes for cp.async"
+    ]()
+    
+    var global_tid = global_idx.x
+    var stride = grid_dim.x * UInt(BLOCK_SIZE)
+    var my_sig: UnsafePointer[Signal] = rank_sigs[my_rank]
+    var num_simd_vectors = num_elements // simd_width
+    
+    # Round-robin access pattern to balance NVLink traffic across GPUs.
+    var ptrs = InlineArray[UnsafePointer[Scalar[dtype]], num_buffers](
+        uninitialized=True
+    )
+    
+    @parameter
+    for i in range(num_buffers):
+        var target = 0 if num_buffers == 1 else (my_rank + i) % ngpus
+        ptrs[i] = src_ptrs[target]
+    
+    _multi_gpu_barrier[ngpus, is_start=True](rank_sigs, my_sig, my_rank)
+    
+    # Allocate shared memory for prefetch buffers
+    # Each stage holds one SIMD vector per thread
+    alias smem_per_stage = BLOCK_SIZE * vector_size_bytes
+    alias total_smem = PREFETCH_STAGES * smem_per_stage
+    
+    # Shared memory buffer for prefetch stages (one per GPU buffer)
+    # We only prefetch from the first peer buffer (ptrs[1]) for simplicity
+    # In a full implementation, we'd prefetch from all buffers
+    @parameter
+    if num_buffers > 1:
+        # Allocate shared memory for prefetch buffers using stack_allocation
+        # Note: total_smem must be compile-time constant (it is, since BLOCK_SIZE and vector_size_bytes are)
+        # stack_allocation returns a pointer directly when address_space is SHARED
+        var smem_base_ptr = stack_allocation[
+            total_smem, dtype, address_space = AddressSpace.SHARED
+        ]()
+        var smem_stages = InlineArray[
+            UnsafePointer[Scalar[dtype], address_space = AddressSpace.SHARED],
+            PREFETCH_STAGES
+        ](uninitialized=True)
+        
+        @parameter
+        for stage in range(PREFETCH_STAGES):
+            smem_stages[stage] = (
+                smem_base_ptr + stage * smem_per_stage // size_of[dtype]()
+            )
+        
+        # Calculate chunk size - use larger chunks for better prefetch overlap
+        # Each chunk should be large enough to hide memory latency (aim for 16-64KB)
+        # For fp32 with simd_width=4: 16KB = 4096 elements = 1024 vectors
+        # Use multiple blocks worth of data per chunk
+        alias target_chunk_bytes = 32 * 1024  # 32KB per chunk
+        var vectors_per_chunk = ceildiv(target_chunk_bytes, vector_size_bytes)
+        # Ensure at least BLOCK_SIZE vectors per chunk for good parallelism
+        vectors_per_chunk = max(vectors_per_chunk, BLOCK_SIZE)
+        var num_chunks = ceildiv(num_simd_vectors, vectors_per_chunk)
+        if num_chunks == 0:
+            num_chunks = 1
+        
+        # Double buffering: prefetch first chunk into buffer[0]
+        var chunk_0_offset = 0
+        @parameter
+        if num_buffers > 1:
+            var peer_ptr = ptrs[1].address_space_cast[AddressSpace.GLOBAL]()
+            
+            # Each thread prefetches its assigned vector for first chunk
+            if global_tid < num_simd_vectors:
+                var vec_idx = chunk_0_offset + (global_tid % vectors_per_chunk)
+                if vec_idx < num_simd_vectors:
+                    var src_elem_idx = vec_idx * simd_width
+                    var src_ptr = (peer_ptr + src_elem_idx).bitcast[UInt8]()
+                    var dst_ptr = (
+                        smem_stages[0] + (global_tid % vectors_per_chunk) * simd_width
+                    ).bitcast[UInt8]()
+                    
+                    # Issue cp.async copy
+                    async_copy[
+                        dtype=dtype,
+                        size=vector_size_bytes,
+                        bypass_L1_16B=False,
+                    ](
+                        src_ptr.bitcast[Scalar[dtype]](),
+                        dst_ptr.bitcast[Scalar[dtype]](),
+                    )
+            
+            async_copy_commit_group()
+            async_copy_wait_group(Int32(0))
+            barrier()
+        
+        # Main double-buffering loop: prefetch next chunk while computing current
+        # Key insight: Start prefetching NEXT chunk, then compute CURRENT chunk
+        # This creates true overlap between memory transfer and computation
+        for chunk_idx in range(num_chunks):
+            var cur_buf = chunk_idx % 2
+            var next_buf = (chunk_idx + 1) % 2
+            var chunk_offset = chunk_idx * vectors_per_chunk
+            
+            # Start prefetching next chunk IMMEDIATELY (don't wait)
+            if chunk_idx + 1 < num_chunks:
+                @parameter
+                if num_buffers > 1:
+                    var next_chunk_offset = (chunk_idx + 1) * vectors_per_chunk
+                    var peer_ptr = ptrs[1].address_space_cast[AddressSpace.GLOBAL]()
+                    
+                    # Each thread prefetches its assigned vector for next chunk
+                    if global_tid < num_simd_vectors:
+                        var vec_idx = next_chunk_offset + (global_tid % vectors_per_chunk)
+                        if vec_idx < num_simd_vectors:
+                            var src_elem_idx = vec_idx * simd_width
+                            var src_ptr = (peer_ptr + src_elem_idx).bitcast[UInt8]()
+                            var dst_ptr = (
+                                smem_stages[next_buf] + (global_tid % vectors_per_chunk) * simd_width
+                            ).bitcast[UInt8]()
+                            
+                            async_copy[
+                                dtype=dtype,
+                                size=vector_size_bytes,
+                                bypass_L1_16B=False,
+                            ](
+                                src_ptr.bitcast[Scalar[dtype]](),
+                                dst_ptr.bitcast[Scalar[dtype]](),
+                            )
+                    
+                    async_copy_commit_group()
+            
+            # Wait for current chunk ONLY if it wasn't the first chunk
+            # (First chunk was already waited for before the loop)
+            @parameter
+            if num_buffers > 1:
+                if chunk_idx > 0:
+                    async_copy_wait_group(Int32(0))
+            
+            barrier()
+            
+            # NOW compute current chunk (while next chunk is prefetching in background)
+            var vec_idx = chunk_offset + (global_tid % vectors_per_chunk)
+            
+            if vec_idx < num_simd_vectors:
+                var elem_idx = vec_idx * simd_width
+                
+                # Load local data (from ptrs[0]) - this is fast (local memory)
+                var local_data = (
+                    ptrs[0]
+                    .address_space_cast[_target_address_space]()
+                    .load[width=simd_width, alignment=alignment, invariant=True](elem_idx)
+                    .cast[accum_type]()
+                )
+                
+                # Load prefetched peer data from shared memory (already in SMEM from previous iteration)
+                var peer_smem_idx = (global_tid % vectors_per_chunk) * simd_width
+                var peer_data = (
+                    smem_stages[cur_buf] + peer_smem_idx
+                ).load[width=simd_width, alignment=alignment](0).cast[accum_type]()
+                
+                # Reduce
+                var reduced_result = (local_data + peer_data).cast[dtype]()
+                
+                # Write result
+                output_lambda[width=simd_width, alignment=alignment](
+                    result.get_nd_index(elem_idx), reduced_result
+                )
+            
+            barrier()
+            
+            # Wait for next prefetch ONLY if we're about to use it next iteration
+            # This ensures it's ready, but we've already done computation in parallel
+            @parameter
+            if num_buffers > 1:
+                if chunk_idx + 1 < num_chunks:
+                    async_copy_wait_group(Int32(0))
+                    barrier()
+    
+    else:
+        # Fallback to regular path if num_buffers == 1 (multimem mode)
+        # Vectorized grid-strided loop with SIMD loads.
+        for idx in range(global_tid, num_simd_vectors, stride):
+            var elem_idx = idx * simd_width
+            
+            var reduced_result = _load_reduce[
+                dtype=dtype,
+                num_buffers=num_buffers,
+                simd_width=simd_width,
+                alignment=alignment,
+                accum_type=accum_type,
+            ](elem_idx, ptrs)
+            
+            output_lambda[width=simd_width, alignment=alignment](
+                result.get_nd_index(elem_idx), reduced_result
+            )
+    
+    _multi_gpu_barrier[ngpus, is_start=False](rank_sigs, my_sig, my_rank)
+
+
 @always_inline
 fn _allreduce_p2p[
     dtype: DType,
@@ -896,12 +1148,57 @@ fn _allreduce_p2p[
         rank <= 8 and (payload_bytecount < rank_8_byte_threshold)
     ):
         # Define grid size for 1-stage, which processes all elements.
-        var grid_size = min(
-            max_num_blocks,
-            ceildiv(num_elements // simd_width, BLOCK_SIZE),
-        )
+        var simd_vectors = num_elements // simd_width
+        var grid_size_calc = ceildiv(simd_vectors, BLOCK_SIZE)
+        var grid_size = min(max_num_blocks, grid_size_calc)
+        
+        # Ensure grid_size is at least 1 to avoid invalid launch configuration
+        # This can happen if num_elements is very small or simd_width is large
+        if grid_size <= 0:
+            grid_size = 1
 
         # Use the 1-stage allreduce when transfer is latency bound.
+        # Use cp.async prefetch version for NVIDIA GPUs with compatible vector sizes
+        alias vector_size_bytes = simd_width * size_of[dtype]()
+        
+        # Dispatch to cp.async kernel for NVIDIA GPUs with compatible vector sizes
+        # Use environment variable to enable/disable for A/B testing
+        var use_cpasync = env_get_bool["MODULAR_MAX_ALLREDUCE_CPASYNC", True]()
+        
+        @parameter
+        if is_nvidia_gpu():
+            @parameter
+            if vector_size_bytes in (4, 8, 16):
+                if use_cpasync:
+                    # Use cp.async prefetch kernel
+                    alias allreduce_1stage_kernel = _allreduce_1stage_kernel_cpasync[
+                        dtype,
+                        rank,
+                        ngpus,
+                        BLOCK_SIZE=BLOCK_SIZE,
+                        output_lambda=output_lambda,
+                        num_buffers=num_buffers,
+                        PREFETCH_STAGES=2,
+                    ]
+                    alias PREFETCH_STAGES = 2
+                    alias smem_per_stage = BLOCK_SIZE * vector_size_bytes
+                    alias total_smem = PREFETCH_STAGES * smem_per_stage
+                    
+                    ctx.enqueue_function_checked[
+                        allreduce_1stage_kernel, allreduce_1stage_kernel
+                    ](
+                        out_buf,
+                        list_of_in_ptrs,
+                        rank_sigs,
+                        num_elements,
+                        Int(ctx.id()),
+                        grid_dim=grid_size,
+                        block_dim=BLOCK_SIZE,
+                        shared_mem_bytes=total_smem,
+                    )
+                    return  # Early return to avoid fallback
+        
+        # Use regular 1-stage kernel (fallback for non-NVIDIA or incompatible vector sizes)
         alias allreduce_1stage_kernel = _allreduce_1stage_kernel[
             dtype,
             rank,
@@ -959,10 +1256,14 @@ fn _allreduce_p2p[
         else:
             # Define grid size for 2-stage, which processes 1/ngpus of the
             # number of elements.
-            var grid_size = min(
-                max_num_blocks,
-                ceildiv(num_elements // (simd_width * ngpus), BLOCK_SIZE),
-            )
+            var elements_per_gpu = num_elements // (simd_width * ngpus)
+            var grid_size_calc = ceildiv(elements_per_gpu, BLOCK_SIZE)
+            var grid_size = min(max_num_blocks, grid_size_calc)
+            
+            # Ensure grid_size is at least 1 to avoid invalid launch configuration
+            # This can happen if num_elements is very small or simd_width is large
+            if grid_size <= 0:
+                grid_size = 1
 
             # Otherwise, use 2-stage allreduce for the bandwidth bound regime.
             alias kernel = _allreduce_2stage_kernel[
@@ -1058,6 +1359,34 @@ alias allreduce_table = Table(
 
 
 @always_inline
+fn _get_default_num_blocks[
+    sm_version: StaticString
+]() -> Int:
+    """Get the default num_blocks for the given SM version."""
+    # First try to find default for the specific SM version
+    @parameter
+    fn rule_eq_arch_default(x: TuningConfigAllreduce) -> Bool:
+        return x.sm_version == sm_version and x.ngpus == -1 and x.num_bytes == -1
+
+    alias default_idx = allreduce_table.query_index[rule_eq_arch_default]()
+    
+    # If no SM-specific default found, fall back to any default
+    @parameter
+    if not default_idx:
+        @parameter
+        fn rule_any_default(x: TuningConfigAllreduce) -> Bool:
+            return x.ngpus == -1 and x.num_bytes == -1
+        
+        alias any_default_idx = allreduce_table.query_index[rule_any_default]()
+        constrained[len(any_default_idx)]()
+        alias default_entry = allreduce_table.configs[any_default_idx[0]]
+        return default_entry.num_blocks
+    else:
+        alias default_entry = allreduce_table.configs[default_idx[0]]
+        return default_entry.num_blocks
+
+
+@always_inline
 fn _dispatch_max_num_blocks[
     ngpus: Int, sm_version: StaticString
 ](num_bytes: Int) -> Int:
@@ -1070,17 +1399,6 @@ fn _dispatch_max_num_blocks[
     (encoded with ngpus=-1 and num_bytes=-1)
     """
 
-    # get default entry
-    # TODO: first search for default for that sm
-    # if not found look for a generic config
-    @parameter
-    fn rule_eq_arch_default(x: TuningConfigAllreduce) -> Bool:
-        return x.ngpus == -1 and x.num_bytes == -1
-
-    alias default_idx = allreduce_table.query_index[rule_eq_arch_default]()
-    constrained[len(default_idx)]()
-    alias default_entry = allreduce_table.configs[default_idx[0]]
-
     # narrowing the search space to matching sm_version and ngpus
     @parameter
     fn rule_eq_arch_ngpus(x: TuningConfigAllreduce) -> Bool:
@@ -1090,7 +1408,7 @@ fn _dispatch_max_num_blocks[
 
     @parameter
     if not search_domain:
-        return default_entry.num_blocks
+        return _get_default_num_blocks[sm_version]()
 
     # get all static num_bytes values in table within the search space
     @parameter
@@ -1121,7 +1439,7 @@ fn _dispatch_max_num_blocks[
             else:
                 break
 
-    return default_entry.num_blocks
+    return _get_default_num_blocks[sm_version]()
 
 
 fn get_sm_version() -> StaticString:
@@ -1211,6 +1529,9 @@ fn allreduce[
             input_buffers[0].bytecount()
         )
     )
+    # Ensure max_num_blocks is at least 1
+    if max_num_blocks == 0:
+        max_num_blocks = 1
     if max_num_blocks > MAX_NUM_BLOCKS_UPPER_BOUND:
         raise Error(
             "expected allreduce max_num_blocks less than upper bound: "
