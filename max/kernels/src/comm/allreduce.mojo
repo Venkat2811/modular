@@ -1265,26 +1265,61 @@ fn _allreduce_p2p[
             if grid_size <= 0:
                 grid_size = 1
 
-            # Otherwise, use 2-stage allreduce for the bandwidth bound regime.
-            alias kernel = _allreduce_2stage_kernel[
-                dtype,
-                rank,
-                ngpus,
-                BLOCK_SIZE=BLOCK_SIZE,
-                output_lambda=output_lambda,
-                pdl_level=pdl_level,
-                num_buffers=num_buffers,
-            ]
-            ctx.enqueue_function_checked[kernel, kernel](
-                out_buf,
-                list_of_in_ptrs,
-                rank_sigs,
-                num_elements,
-                Int(ctx.id()),
-                grid_dim=grid_size,
-                block_dim=BLOCK_SIZE,
-                attributes=pdl_launch_attributes(pdl_level),
-            )
+            # Enable PDL overlap for 2-stage kernel when size is large enough
+            # PDL allows overlapping reduce-scatter and all-gather phases
+            alias pdl_threshold_bytes = 32 * 1024 * 1024  # 32MB threshold
+            
+            # Check if PDL should be enabled via environment variable or heuristic
+            var force_pdl = env_get_bool["MODULAR_MAX_ALLREDUCE_PDL", False]()
+            var should_enable_pdl = force_pdl or (payload_bytecount >= pdl_threshold_bytes)
+            
+            # Only enable PDL for 2-stage kernel (bandwidth-bound regime)
+            # PDL is most beneficial when we have two distinct phases to overlap
+            # We need to instantiate both kernel variants and choose at runtime
+            # Check if pdl_level is OFF (level 0) - handle both PDLLevel.OFF and PDLLevel(0)
+            var pdl_is_off = pdl_level._level == 0
+            if should_enable_pdl and pdl_is_off:
+                # Use PDL-enabled kernel variant
+                alias kernel_pdl = _allreduce_2stage_kernel[
+                    dtype,
+                    rank,
+                    ngpus,
+                    BLOCK_SIZE=BLOCK_SIZE,
+                    output_lambda=output_lambda,
+                    pdl_level=PDLLevel.OVERLAP_AT_BEGINNING,
+                    num_buffers=num_buffers,
+                ]
+                ctx.enqueue_function_checked[kernel_pdl, kernel_pdl](
+                    out_buf,
+                    list_of_in_ptrs,
+                    rank_sigs,
+                    num_elements,
+                    Int(ctx.id()),
+                    grid_dim=grid_size,
+                    block_dim=BLOCK_SIZE,
+                    attributes=pdl_launch_attributes(PDLLevel.OVERLAP_AT_BEGINNING),
+                )
+            else:
+                # Use regular 2-stage kernel without PDL
+                alias kernel = _allreduce_2stage_kernel[
+                    dtype,
+                    rank,
+                    ngpus,
+                    BLOCK_SIZE=BLOCK_SIZE,
+                    output_lambda=output_lambda,
+                    pdl_level=pdl_level,
+                    num_buffers=num_buffers,
+                ]
+                ctx.enqueue_function_checked[kernel, kernel](
+                    out_buf,
+                    list_of_in_ptrs,
+                    rank_sigs,
+                    num_elements,
+                    Int(ctx.id()),
+                    grid_dim=grid_size,
+                    block_dim=BLOCK_SIZE,
+                    attributes=pdl_launch_attributes(pdl_level),
+                )
 
 
 @fieldwise_init
@@ -1539,6 +1574,11 @@ fn allreduce[
             + " but got: "
             + String(max_num_blocks)
         )
+    
+    # Enable PDL overlap for 2-stage kernel when size is large enough
+    # PDL allows overlapping reduce-scatter and all-gather phases
+    # Note: pdl_level is a compile-time parameter, so we handle PDL enablement
+    # in _allreduce_p2p where we can make runtime decisions
 
     # Check P2P availability.
     if not can_enable_p2p():
